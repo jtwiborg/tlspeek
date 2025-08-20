@@ -1,4 +1,4 @@
-// tlspeek_tls.go
+// tlspeek.go
 package main
 
 import (
