@@ -66,21 +66,21 @@ func main() {
 	args := parseArgs()
 	target := net.JoinHostPort(args.ip, args.port)
 
-	// 1) TCP (direkte eller via proxy)
+	// 1) TCP (direct or by proxy)
 	rawConn, err := dial(target, args.proxy, args.timeout)
 	if err != nil { die("dial: %v", err) }
 	defer rawConn.Close()
 	_ = rawConn.SetDeadline(time.Now().Add(args.timeout))
 
-	// 2) TLS-klient (ingen verifisering, ingen klientsert). Henter sert før det evt. feiler.
+	// 2) TLS-klient (No verification, No Client certificate). Get the certificate even if the connection could fail later.
 	conf := &tls.Config{
-		InsecureSkipVerify: true,      // vi inspiserer kun
-		ServerName:         args.sni,  // SNI (tom => ingen SNI)
-		MinVersion:         tls.VersionTLS12, // 1.2 og 1.3
+		InsecureSkipVerify: true,      // We will inspect only
+		ServerName:         args.sni,  // SNI (Empty => No SNI)
+		MinVersion:         tls.VersionTLS12, // 1.2 and 1.3
 	}
 	tconn := tls.Client(rawConn, conf)
 
-	// 3) Handshake – selv ved feil får vi ofte PeerCertificates
+	// 3) Handshake – Even if it it fails we may get the PeerCertificates
 	err = tconn.Handshake()
 	state := tconn.ConnectionState()
 	_ = tconn.Close()
