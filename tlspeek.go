@@ -3,10 +3,14 @@ package main
 
 import (
 	"bufio"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -17,27 +21,45 @@ import (
 	"time"
 )
 
+var version = "dev"
+
 func usage() {
-	fmt.Fprintf(os.Stderr, "Usage:\n  %s --ip <IP> --port <port> [--sni <hostname>] [--proxy <url>] [--timeout 7s] [--dump-pem]\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "Usage:\n  %s --host <host|IP> [--port <port>] [--sni <hostname>] [--proxy <url>] [--timeout 7s] [--dump-pem] [--json]\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "  --ip is an alias for --host\n")
 	fmt.Fprintf(os.Stderr, "Proxy examples: http://user:pass@proxy:8080  |  socks5://user:pass@proxy:1080\n")
 	os.Exit(2)
 }
 
 type Args struct {
-	ip       string
+	host     string
 	port     string
 	sni      string
 	proxy    string
 	timeout  time.Duration
 	dumpPEM  bool
+	jsonOut  bool
+}
+
+type CertInfo struct {
+	Subject    string   `json:"subject"`
+	Issuer     string   `json:"issuer"`
+	CN         string   `json:"cn"`
+	Serial     string   `json:"serial"`
+	NotBefore  string   `json:"notBefore"`
+	NotAfter   string   `json:"notAfter"`
+	Thumbprint string   `json:"thumbprint"`
+	TLSVersion string   `json:"tlsVersion"`
+	KeyType    string   `json:"keyType"`
+	SANs       []string `json:"sans,omitempty"`
+	PEM        []string `json:"pem,omitempty"`
 }
 
 func parseArgs() Args {
 	a := Args{port: "443", timeout: 7 * time.Second}
 	for i := 1; i < len(os.Args); i++ {
 		switch os.Args[i] {
-		case "--ip":
-			i++; a.ip = must(os.Args, i)
+		case "--ip", "--host":
+			i++; a.host = must(os.Args, i)
 		case "--port":
 			i++; a.port = must(os.Args, i)
 		case "--sni":
@@ -49,13 +71,18 @@ func parseArgs() Args {
 			a.timeout = d
 		case "--dump-pem":
 			a.dumpPEM = true
-		case "-h","--help","/?":
+		case "--json":
+			a.jsonOut = true
+		case "--version":
+			fmt.Printf("tlspeek %s\n", version)
+			os.Exit(0)
+		case "-h", "--help", "/?":
 			usage()
 		default:
 			if strings.HasPrefix(os.Args[i], "-") { usage() }
 		}
 	}
-	if a.ip == "" { usage() }
+	if a.host == "" { usage() }
 	return a
 }
 
@@ -64,7 +91,7 @@ func die(f string, v ...any){ fmt.Fprintf(os.Stderr,"ERROR: "+f+"\n",v...); os.E
 
 func main() {
 	args := parseArgs()
-	target := net.JoinHostPort(args.ip, args.port)
+	target := net.JoinHostPort(args.host, args.port)
 
 	// 1) TCP (direct or by proxy)
 	rawConn, err := dial(target, args.proxy, args.timeout)
@@ -95,26 +122,90 @@ func main() {
 	leaf := state.PeerCertificates[0]
 	sum := sha1.Sum(leaf.Raw)
 
-	fmt.Printf("Subject    : %s\n", leaf.Subject.String())
-	fmt.Printf("Issuer     : %s\n", leaf.Issuer.String())
-	fmt.Printf("CN         : %s\n", leaf.Subject.CommonName)
-	fmt.Printf("NotBefore  : %s\n", leaf.NotBefore.UTC().Format(time.RFC3339))
-	fmt.Printf("NotAfter   : %s\n", leaf.NotAfter.UTC().Format(time.RFC3339))
-	fmt.Printf("Thumbprint : %s\n", strings.ToUpper(hex.EncodeToString(sum[:])))
-
-	if len(leaf.DNSNames) > 0 || len(leaf.IPAddresses) > 0 {
-		fmt.Printf("SANs       :")
-		for _, d := range leaf.DNSNames { fmt.Printf(" %s", d) }
-		for _, ip := range leaf.IPAddresses { fmt.Printf(" %s", ip.String()) }
-		fmt.Println()
+	// Collect SANs
+	var sans []string
+	for _, d := range leaf.DNSNames {
+		sans = append(sans, d)
+	}
+	for _, ip := range leaf.IPAddresses {
+		sans = append(sans, ip.String())
 	}
 
-	if args.dumpPEM {
-		fmt.Println("\n--- BEGIN CERTIFICATE CHAIN ---")
-		for _, cert := range state.PeerCertificates {
-			_ = pem.Encode(os.Stdout, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	if args.jsonOut {
+		info := CertInfo{
+			Subject:    leaf.Subject.String(),
+			Issuer:     leaf.Issuer.String(),
+			CN:         leaf.Subject.CommonName,
+			Serial:     fmt.Sprintf("%X", leaf.SerialNumber),
+			NotBefore:  leaf.NotBefore.UTC().Format(time.RFC3339),
+			NotAfter:   leaf.NotAfter.UTC().Format(time.RFC3339),
+			Thumbprint: strings.ToUpper(hex.EncodeToString(sum[:])),
+			TLSVersion: tlsVersionString(state.Version),
+			KeyType:    publicKeyInfo(leaf.PublicKey),
+			SANs:       sans,
 		}
-		fmt.Println("--- END CERTIFICATE CHAIN ---")
+		if args.dumpPEM {
+			for _, cert := range state.PeerCertificates {
+				info.PEM = append(info.PEM, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})))
+			}
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(info)
+	} else {
+		fmt.Printf("Subject    : %s\n", leaf.Subject.String())
+		fmt.Printf("Issuer     : %s\n", leaf.Issuer.String())
+		fmt.Printf("CN         : %s\n", leaf.Subject.CommonName)
+		fmt.Printf("Serial     : %X\n", leaf.SerialNumber)
+		fmt.Printf("NotBefore  : %s\n", leaf.NotBefore.UTC().Format(time.RFC3339))
+		fmt.Printf("NotAfter   : %s\n", leaf.NotAfter.UTC().Format(time.RFC3339))
+		fmt.Printf("Thumbprint : %s\n", strings.ToUpper(hex.EncodeToString(sum[:])))
+		fmt.Printf("TLSVersion : %s\n", tlsVersionString(state.Version))
+		fmt.Printf("KeyType    : %s\n", publicKeyInfo(leaf.PublicKey))
+
+		if len(sans) > 0 {
+			fmt.Printf("SANs       :")
+			for _, s := range sans {
+				fmt.Printf(" %s", s)
+			}
+			fmt.Println()
+		}
+
+		if args.dumpPEM {
+			fmt.Println("\n--- BEGIN CERTIFICATE CHAIN ---")
+			for _, cert := range state.PeerCertificates {
+				_ = pem.Encode(os.Stdout, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+			}
+			fmt.Println("--- END CERTIFICATE CHAIN ---")
+		}
+	}
+}
+
+func tlsVersionString(v uint16) string {
+	switch v {
+	case tls.VersionTLS10:
+		return "TLS 1.0"
+	case tls.VersionTLS11:
+		return "TLS 1.1"
+	case tls.VersionTLS12:
+		return "TLS 1.2"
+	case tls.VersionTLS13:
+		return "TLS 1.3"
+	default:
+		return fmt.Sprintf("0x%04x", v)
+	}
+}
+
+func publicKeyInfo(pub any) string {
+	switch k := pub.(type) {
+	case *rsa.PublicKey:
+		return fmt.Sprintf("RSA %d", k.N.BitLen())
+	case *ecdsa.PublicKey:
+		return fmt.Sprintf("ECDSA %s", k.Curve.Params().Name)
+	case ed25519.PublicKey:
+		return "Ed25519"
+	default:
+		return fmt.Sprintf("%T", pub)
 	}
 }
 

@@ -8,6 +8,10 @@
 *.so
 *.dylib
 
+# Allow release binaries and checksums in dist/
+!dist/
+!dist/**
+
 # Test binary, built with `go test -c`
 *.test
 
